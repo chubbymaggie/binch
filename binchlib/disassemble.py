@@ -42,10 +42,9 @@ class Disassembler():
 
     def loadELF(self, filename):
         try:
-            self.elf = ELFFile(file(sys.argv[1]))
+            self.elf = ELFFile(file(filename))
         except:
-            print "[-] It is not ELF file: "+sys.argv[1]
-            sys.exit()
+            raise Exception("[-] This file is not an ELF file: %s" % filename)
 
         self.arch = self.elf.get_machine_arch()
 
@@ -66,21 +65,24 @@ class Disassembler():
             vaddr = elf_segment.header.p_vaddr - ELF_PAGEOFFSET
             memsz = (memsz + align ) & ~(align-1)
 
-            with open(sys.argv[1], 'rb') as f:
+            with open(filename, 'rb') as f:
                 f.seek(offset, 0)
                 data = f.read(filesz)
                 self.memory.append((vaddr, offset, memsz, data))
 
         self.entry = self.elf.header.e_entry
 
-        # Load symbol table
         self.symtab = dict()
         self.thumbtab = list()
+
+        self.code_addrs = []
+
         for section in self.elf.iter_sections():
             if isinstance(section, SymbolTableSection):
+                # Load symbol table
                 for symbol in section.iter_symbols():
                     if symbol['st_info']['type'] == 'STT_FUNC':
-                        if self.isthumb(symbol['st_value']):
+                        if self.is_thumb_addr(symbol['st_value']):
                             self.symtab[symbol['st_value'] - 1] = symbol.name
                         else:
                             self.symtab[symbol['st_value']] = symbol.name
@@ -89,13 +91,14 @@ class Disassembler():
                             self.thumbtab.append((symbol['st_value'], True))
                         elif symbol.name == '$a':   #ARM
                             self.thumbtab.append((symbol['st_value'], False))
+            else:
+                # Assumption: Code section's flag is AX (ALLOC=2, EXEC=4)
+                if section['sh_flags'] == 6:
+                    self.code_addrs.append({'address': section['sh_addr'], 'size': section['sh_size']})
 
         self.thumbtab.sort(key=lambda tup: tup[0])
 
-        text_section = self.elf.get_section_by_name('.text')
-        self.text = text_section.data()
-        self.text_addr = text_section['sh_addr']
-        self.text_size = text_section['sh_size']
+        self.code_addrs = sorted(self.code_addrs, key=lambda k: k['address'])
 
         arch = {'x86':CS_ARCH_X86,'x64':CS_ARCH_X86, 'ARM':CS_ARCH_ARM}[self.arch]
         mode = {'x86':CS_MODE_32, 'x64':CS_MODE_64, 'ARM':CS_MODE_ARM}[self.arch]
@@ -115,14 +118,17 @@ class Disassembler():
             for addr, isthumb in self.thumbtab:
                 if address < addr:
                     if thumb:
-                        disasms.extend([(i, True) for i in self.t_md.disasm(self.read_memory(address, addr-address), address)])
+                        disasms.extend([i for i in self.t_md.disasm(self.read_memory(address, addr-address), address)])
                     else:
-                        disasms.extend([(i, False) for i in self.md.disasm(self.read_memory(address, addr-address), address)])
+                        disasms.extend([i for i in self.md.disasm(self.read_memory(address, addr-address), address)])
                 address = addr
                 thumb = isthumb
             return disasms
         else:
-            return [(i, False) for i in self.md.disasm(self.read_memory(address, size), address)]
+            return [i for i in self.md.disasm(self.read_memory(address, size), address)]
+
+    def is_thumb_instr(self, instr):
+        return instr._cs.mode == CS_MODE_THUMB
 
     def save(self):
         def save_binary(filename):
@@ -153,7 +159,7 @@ class Disassembler():
 
         signals.set_prompt.send(self, text="Save to (filename): ", callback=save_binary)
 
-    def isthumb(self, address):
+    def is_thumb_addr(self, address):
         if self.arch == 'ARM' and (address & 1) == 1:
             return True
         else:
